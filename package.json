@@ -1,0 +1,17 @@
+{
+  "name": "smart-library-api-v2",
+  "version": "2.1.0",
+  "description": "智能图书馆高性能API - 全新部署版本",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.9.0",
+    "pg": "^8.11.0",
+    "ioredis": "^5.3.2"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
