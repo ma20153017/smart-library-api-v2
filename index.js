@@ -1,6 +1,6 @@
-// 智能图书馆高性能API - v3.5.0
+// 智能图书馆高性能API - v3.6.0
 // 支持PostgreSQL数据库 + Redis缓存 + AI智能推荐 + AI语义理解作者识别系统
-// AI语义理解版本 - 2025.08.27
+// 性能优化缓存版本 - 2025.08.27
 
 const axios = require('axios');
 const { Pool } = require('pg');
@@ -33,7 +33,9 @@ function initDatabase() {
         ssl: { rejectUnauthorized: false },
         max: 20,
         idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 2000,
+        connectionTimeoutMillis: 10000,  // V3.6.0: 增加连接超时到10秒
+        query_timeout: 15000,           // V3.6.0: 查询超时15秒
+        statement_timeout: 20000        // V3.6.0: 语句超时20秒
       });
       console.log('✅ [V2] PostgreSQL连接池已初始化');
     } catch (error) {
@@ -144,7 +146,7 @@ async function handleIndex(req, res) {
     
   return res.status(200).json({
       api: "智能图书馆高性能API",
-      version: "3.5.0",
+      version: "3.6.0",
     status: "运行中",
       database: {
         connected: !!dbPool,
@@ -155,6 +157,21 @@ async function handleIndex(req, res) {
       cache: {
         connected: !!redisClient,
         status: redisClient ? (redisClient.status === 'ready' ? '已连接' : '连接中') : '未连接'
+      },
+      ai: {
+        provider: "DeepSeek",
+        configured: !!process.env.DEEPSEEK_API_KEY,
+        model: "deepseek-chat"
+      },
+      performance: {
+        cache_hits: PERFORMANCE_STATS.cache_hits,
+        cache_misses: PERFORMANCE_STATS.cache_misses,
+        cache_hit_rate: PERFORMANCE_STATS.cache_hits + PERFORMANCE_STATS.cache_misses > 0 
+          ? (PERFORMANCE_STATS.cache_hits / (PERFORMANCE_STATS.cache_hits + PERFORMANCE_STATS.cache_misses) * 100).toFixed(1) + '%'
+          : '0%',
+        ai_calls: PERFORMANCE_STATS.ai_calls,
+        db_queries: PERFORMANCE_STATS.db_queries,
+        total_requests: PERFORMANCE_STATS.total_requests
       },
     endpoints: [
         { path: "/", method: "GET", description: "API信息和统计" },
@@ -681,6 +698,9 @@ async function handleSearch(req, res) {
  */
 async function handleRecommend(req, res) {
   try {
+    // V3.6.0: 性能统计
+    PERFORMANCE_STATS.total_requests++;
+    
     if (req.method !== 'POST') {
       return res.status(405).json({ error: '只支持POST请求' });
     }
@@ -929,6 +949,31 @@ const FOREIGN_NAME_PATTERNS = [
   /[A-Za-z]+[\u00b7][A-Za-z]+/,                // 音译名 "卡夫卡"
 ];
 
+// 缓存配置 (V3.6.0)
+const CACHE_CONFIG = {
+  AI_ANALYSIS_TTL: 7200,      // AI分析结果缓存2小时
+  AUTHOR_QUERY_TTL: 3600,     // 作者查询缓存1小时
+  DATABASE_QUERY_TTL: 1800,   // 数据库查询缓存30分钟
+  QUICK_CHECK_TTL: 900,       // 快速检查缓存15分钟
+};
+
+// 缓存键前缀
+const CACHE_KEYS = {
+  AI_ANALYSIS: 'ai:analysis:',
+  AUTHOR_QUERY: 'author:query:',
+  DB_QUERY: 'db:query:',
+  QUICK_CHECK: 'quick:check:',
+};
+
+// 性能统计 (V3.6.0)
+const PERFORMANCE_STATS = {
+  cache_hits: 0,
+  cache_misses: 0,
+  ai_calls: 0,
+  db_queries: 0,
+  total_requests: 0
+};
+
 // 作者优先级分组 (基于真实书籍数量)
 const AUTHOR_PRIORITY = {
   ultra_high: ['紀江紅', '衛斯理', '薛金星', '任志鴻', '(港)嚴沁著'],  // 100+本书
@@ -938,120 +983,176 @@ const AUTHOR_PRIORITY = {
 };
 
 /**
- * 快速关键词预筛选 - 第一层分析
+ * 缓存辅助函数 (V3.6.0)
  */
-function quickAuthorIndicatorCheck(query) {
-  console.log(`🔍 [Quick] 快速预筛选查询: "${query}"`);
+async function getCachedResult(key, fallbackFn, ttl = 3600) {
+  if (!redisClient) {
+    console.log(`⚠️ [Cache] Redis不可用，直接执行查询`);
+    PERFORMANCE_STATS.cache_misses++;
+    return await fallbackFn();
+  }
   
-  const text = query.toLowerCase();
-  let authorScore = 0;
-  let nonAuthorScore = 0;
-  let possibleAuthors = [];
+  try {
+    const cached = await redisClient.get(key);
+    if (cached) {
+      console.log(`🚀 [Cache] 缓存命中: ${key.substring(0, 50)}...`);
+      PERFORMANCE_STATS.cache_hits++;
+      return JSON.parse(cached);
+    }
+  } catch (error) {
+    console.error(`❌ [Cache] 缓存读取失败:`, error);
+  }
   
-  // 1. 检查非作者查询的明确指示词
-  for (const indicator of NON_AUTHOR_INDICATORS) {
-    if (text.includes(indicator)) {
-      nonAuthorScore += 2;
-      console.log(`❌ [Quick] 发现非作者指示词: "${indicator}"`);
+  // 缓存未命中
+  PERFORMANCE_STATS.cache_misses++;
+  
+  // 执行原始函数
+  const result = await fallbackFn();
+  
+  // 缓存结果
+  if (result && redisClient) {
+    try {
+      await redisClient.setex(key, ttl, JSON.stringify(result));
+      console.log(`💾 [Cache] 结果已缓存: ${key.substring(0, 50)}...`);
+    } catch (error) {
+      console.error(`❌ [Cache] 缓存写入失败:`, error);
     }
   }
   
-  // 2. 检查作者查询指示词
-  for (const strongIndicator of AUTHOR_INDICATORS.strong) {
-    if (text.includes(strongIndicator)) {
-      authorScore += 3;
-      console.log(`✅ [Quick] 发现强作者指示词: "${strongIndicator}"`);
-    }
-  }
-  
-  for (const mediumIndicator of AUTHOR_INDICATORS.medium) {
-    if (text.includes(mediumIndicator)) {
-      authorScore += 2;
-      console.log(`🔍 [Quick] 发现中等作者指示词: "${mediumIndicator}"`);
-    }
-  }
-  
-  for (const weakIndicator of AUTHOR_INDICATORS.weak) {
-    if (text.includes(weakIndicator)) {
-      authorScore += 1;
-    }
-  }
-  
-  // 3. 检查可能的人名模式
-  // 中文人名
-  for (const pattern of CHINESE_NAME_PATTERNS) {
-    const matches = text.match(pattern);
-    if (matches) {
-      for (const match of matches) {
-        if (match.length >= 2 && match.length <= 4) {
-          possibleAuthors.push({
-            name: match,
-            type: 'chinese',
-            confidence: 0.7
-          });
-          authorScore += 2;
-          console.log(`👤 [Quick] 发现可能的中文作者名: "${match}"`);
-        }
-      }
-    }
-  }
-  
-  // 外文人名
-  for (const pattern of FOREIGN_NAME_PATTERNS) {
-    const matches = text.match(pattern);
-    if (matches) {
-      for (const match of matches) {
-        possibleAuthors.push({
-          name: match,
-          type: 'foreign',
-          confidence: 0.8
-        });
-        authorScore += 2;
-        console.log(`👤 [Quick] 发现可能的外文作者名: "${match}"`);
-      }
-    }
-  }
-  
-  // 4. 检查高频作者直接匹配
-  for (const knownAuthor of KNOWN_AUTHORS) {
-    if (text.includes(knownAuthor)) {
-      possibleAuthors.push({
-        name: knownAuthor,
-        type: 'known',
-        confidence: 0.95
-      });
-      authorScore += 4;
-      console.log(`⭐ [Quick] 发现已知高频作者: "${knownAuthor}"`);
-    }
-  }
-  
-  // 5. 计算综合置信度
-  const netScore = authorScore - nonAuthorScore;
-  const confidence = Math.min(Math.max(netScore / 10, 0), 1);
-  const possible = netScore > 0 && possibleAuthors.length > 0;
-  
-  console.log(`📊 [Quick] 作者得分:${authorScore}, 非作者得分:${nonAuthorScore}, 净得分:${netScore}, 置信度:${confidence}`);
-  
-  return {
-    possible,
-    confidence,
-    authorScore,
-    nonAuthorScore,
-    possibleAuthors: possibleAuthors.sort((a, b) => b.confidence - a.confidence),
-    needsAIAnalysis: confidence > 0.3 && confidence < 0.8, // 不确定的情况需要AI分析
-    method: 'quick_keyword'
-  };
+  return result;
 }
 
 /**
- * AI语义理解 - 第二层分析
+ * 生成缓存键
+ */
+function generateCacheKey(prefix, ...parts) {
+  return prefix + parts.map(p => 
+    typeof p === 'string' ? p.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '_') : String(p)
+  ).join(':');
+}
+
+/**
+ * 快速关键词预筛选 - 第一层分析 (V3.6.0 - 缓存优化版)
+ */
+async function quickAuthorIndicatorCheck(query) {
+  const cacheKey = generateCacheKey(CACHE_KEYS.QUICK_CHECK, query);
+  
+  return await getCachedResult(cacheKey, async () => {
+    console.log(`🔍 [Quick] 快速预筛选查询: "${query}"`);
+    
+    const text = query.toLowerCase();
+    let authorScore = 0;
+    let nonAuthorScore = 0;
+    let possibleAuthors = [];
+    
+    // 1. 检查非作者查询的明确指示词
+    for (const indicator of NON_AUTHOR_INDICATORS) {
+      if (text.includes(indicator)) {
+        nonAuthorScore += 2;
+        console.log(`❌ [Quick] 发现非作者指示词: "${indicator}"`);
+      }
+    }
+    
+    // 2. 检查作者查询指示词
+    for (const strongIndicator of AUTHOR_INDICATORS.strong) {
+      if (text.includes(strongIndicator)) {
+        authorScore += 3;
+        console.log(`✅ [Quick] 发现强作者指示词: "${strongIndicator}"`);
+      }
+    }
+    
+    for (const mediumIndicator of AUTHOR_INDICATORS.medium) {
+      if (text.includes(mediumIndicator)) {
+        authorScore += 2;
+        console.log(`🔍 [Quick] 发现中等作者指示词: "${mediumIndicator}"`);
+      }
+    }
+    
+    for (const weakIndicator of AUTHOR_INDICATORS.weak) {
+      if (text.includes(weakIndicator)) {
+        authorScore += 1;
+      }
+    }
+    
+    // 3. 检查可能的人名模式
+    // 中文人名
+    for (const pattern of CHINESE_NAME_PATTERNS) {
+      const matches = text.match(pattern);
+      if (matches) {
+        for (const match of matches) {
+          if (match.length >= 2 && match.length <= 4) {
+            possibleAuthors.push({
+              name: match,
+              type: 'chinese',
+              confidence: 0.7
+            });
+            authorScore += 2;
+            console.log(`👤 [Quick] 发现可能的中文作者名: "${match}"`);
+          }
+        }
+      }
+    }
+    
+    // 外文人名
+    for (const pattern of FOREIGN_NAME_PATTERNS) {
+      const matches = text.match(pattern);
+      if (matches) {
+        for (const match of matches) {
+          possibleAuthors.push({
+            name: match,
+            type: 'foreign',
+            confidence: 0.8
+          });
+          authorScore += 2;
+          console.log(`👤 [Quick] 发现可能的外文作者名: "${match}"`);
+        }
+      }
+    }
+    
+    // 4. 检查高频作者直接匹配
+    for (const knownAuthor of KNOWN_AUTHORS) {
+      if (text.includes(knownAuthor)) {
+        possibleAuthors.push({
+          name: knownAuthor,
+          type: 'known',
+          confidence: 0.95
+        });
+        authorScore += 4;
+        console.log(`⭐ [Quick] 发现已知高频作者: "${knownAuthor}"`);
+      }
+    }
+    
+    // 5. 计算综合置信度
+    const netScore = authorScore - nonAuthorScore;
+    const confidence = Math.min(Math.max(netScore / 10, 0), 1);
+    const possible = netScore > 0 && possibleAuthors.length > 0;
+    
+    console.log(`📊 [Quick] 作者得分:${authorScore}, 非作者得分:${nonAuthorScore}, 净得分:${netScore}, 置信度:${confidence}`);
+    
+    return {
+      possible,
+      confidence,
+      authorScore,
+      nonAuthorScore,
+      possibleAuthors: possibleAuthors.sort((a, b) => b.confidence - a.confidence),
+      needsAIAnalysis: confidence > 0.3 && confidence < 0.8, // 不确定的情况需要AI分析
+      method: 'quick_keyword'
+    };
+  }, CACHE_CONFIG.QUICK_CHECK_TTL);
+}
+
+/**
+ * AI语义理解 - 第二层分析 (V3.6.0 - 缓存优化版)
  */
 async function analyzeAuthorQueryWithAI(query, quickCheckResult) {
-  console.log(`🧠 [AI] 开始AI语义分析: "${query}"`);
+  const cacheKey = generateCacheKey(CACHE_KEYS.AI_ANALYSIS, query);
   
-  try {
-    // 构建智能提示词
-    const prompt = `请分析以下中文查询是否在询问特定作者的书籍作品。
+  return await getCachedResult(cacheKey, async () => {
+    console.log(`🧠 [AI] 开始AI语义分析: "${query}"`);
+    
+    try {
+      // 构建智能提示词
+      const prompt = `请分析以下中文查询是否在询问特定作者的书籍作品。
 
 查询内容："${query}"
 
@@ -1073,57 +1174,60 @@ async function analyzeAuthorQueryWithAI(query, quickCheckResult) {
 - "推荐科幻小说" → 非作者查询
 - "有余华的作品吗" → 作者查询，作者名：余华`;
 
-    // 调用DeepSeek API
-    const response = await axios.post('https://api.deepseek.com/chat/completions', {
-      model: 'deepseek-chat',
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      max_tokens: 200,
-      temperature: 0.1
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    });
-
-    if (response.data && response.data.choices && response.data.choices[0]) {
-      const aiContent = response.data.choices[0].message.content.trim();
-      console.log(`🧠 [AI] AI原始回复: ${aiContent}`);
+      // 调用DeepSeek API (优化超时设置)
+      PERFORMANCE_STATS.ai_calls++;  // V3.6.0: AI调用统计
       
-      try {
-        const aiResult = JSON.parse(aiContent);
+      const response = await axios.post('https://api.deepseek.com/chat/completions', {
+        model: 'deepseek-chat',
+        messages: [
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        max_tokens: 200,
+        temperature: 0.1
+      }, {
+        headers: {
+          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000  // 增加超时到15秒
+      });
+
+      if (response.data && response.data.choices && response.data.choices[0]) {
+        const aiContent = response.data.choices[0].message.content.trim();
+        console.log(`🧠 [AI] AI原始回复: ${aiContent}`);
         
-        if (aiResult.isAuthorQuery && aiResult.authorName) {
-          console.log(`✅ [AI] AI识别为作者查询: ${aiResult.authorName} (置信度: ${aiResult.confidence})`);
-          return {
-            type: 'author',
-            author: aiResult.authorName,
-            confidence: aiResult.confidence,
-            reasoning: aiResult.reasoning,
-            method: 'ai_semantic'
-          };
-        } else {
-          console.log(`❌ [AI] AI识别为非作者查询: ${aiResult.reasoning}`);
+        try {
+          const aiResult = JSON.parse(aiContent);
+          
+          if (aiResult.isAuthorQuery && aiResult.authorName) {
+            console.log(`✅ [AI] AI识别为作者查询: ${aiResult.authorName} (置信度: ${aiResult.confidence})`);
+            return {
+              type: 'author',
+              author: aiResult.authorName,
+              confidence: aiResult.confidence,
+              reasoning: aiResult.reasoning,
+              method: 'ai_semantic'
+            };
+          } else {
+            console.log(`❌ [AI] AI识别为非作者查询: ${aiResult.reasoning}`);
+            return null;
+          }
+        } catch (parseError) {
+          console.error(`❌ [AI] JSON解析失败:`, parseError);
           return null;
         }
-      } catch (parseError) {
-        console.error(`❌ [AI] JSON解析失败:`, parseError);
+      } else {
+        console.error(`❌ [AI] AI响应格式异常`);
         return null;
       }
-    } else {
-      console.error(`❌ [AI] AI响应格式异常`);
+    } catch (error) {
+      console.error(`❌ [AI] AI分析异常:`, error);
       return null;
     }
-  } catch (error) {
-    console.error(`❌ [AI] AI分析异常:`, error);
-    return null;
-  }
+  }, CACHE_CONFIG.AI_ANALYSIS_TTL);
 }
 
 /**
@@ -1203,15 +1307,18 @@ async function detectAuthorQuery(query) {
 }
 
 /**
- * 动态作者查找 - 三层匹配策略
+ * 动态作者查找 - 三层匹配策略 (V3.6.0 - 缓存优化版)
  */
 async function dynamicAuthorLookup(candidateAuthor, originalQuery) {
-  console.log(`🔍 [Dynamic] 动态查找作者: "${candidateAuthor}"`);
+  const cacheKey = generateCacheKey(CACHE_KEYS.AUTHOR_QUERY, candidateAuthor, originalQuery);
   
-  if (!dbPool) {
-    console.log(`❌ [Dynamic] 数据库连接不可用`);
-    return null;
-  }
+  return await getCachedResult(cacheKey, async () => {
+    console.log(`🔍 [Dynamic] 动态查找作者: "${candidateAuthor}"`);
+    
+    if (!dbPool) {
+      console.log(`❌ [Dynamic] 数据库连接不可用`);
+      return null;
+    }
   
   try {
     // 清理候选作者名
@@ -1231,6 +1338,7 @@ async function dynamicAuthorLookup(candidateAuthor, originalQuery) {
       LIMIT 1
     `;
     
+    PERFORMANCE_STATS.db_queries++;  // V3.6.0: 数据库查询统计
     let result = await dbPool.query(sql, [cleanAuthor]);
     
     if (result.rows.length > 0) {
@@ -1337,6 +1445,7 @@ async function dynamicAuthorLookup(candidateAuthor, originalQuery) {
     console.error(`❌ [Dynamic] 动态查找作者异常:`, error);
     return null;
   }
+  }, CACHE_CONFIG.AUTHOR_QUERY_TTL);
 }
 
 /**
