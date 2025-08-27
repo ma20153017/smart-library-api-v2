@@ -1,6 +1,6 @@
-// 智能图书馆高性能API - v3.6.0
+// 智能图书馆高性能API - v3.6.1
 // 支持PostgreSQL数据库 + Redis缓存 + AI智能推荐 + AI语义理解作者识别系统
-// 性能优化缓存版本 - 2025.08.27
+// 异步调用修复版本 - 2025.08.27
 
 const axios = require('axios');
 const { Pool } = require('pg');
@@ -146,7 +146,7 @@ async function handleIndex(req, res) {
     
   return res.status(200).json({
       api: "智能图书馆高性能API",
-      version: "3.6.0",
+      version: "3.6.1",
     status: "运行中",
       database: {
         connected: !!dbPool,
@@ -1238,7 +1238,7 @@ async function detectAuthorQuery(query) {
   
   try {
     // 第一层：快速关键词预筛选
-    const quickCheck = quickAuthorIndicatorCheck(query);
+    const quickCheck = await quickAuthorIndicatorCheck(query);
     
     if (!quickCheck.possible) {
       console.log(`❌ [Hybrid] 快速预筛选判定为非作者查询`);
